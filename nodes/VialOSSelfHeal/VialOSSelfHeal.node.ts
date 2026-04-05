@@ -7,6 +7,8 @@ import {
   IDataObject,
 } from 'n8n-workflow';
 
+import { STARTER_GENES, getStarterGeneCount } from './starterGenes';
+
 // Error classification — maps HTTP/API errors to PCEC failure codes
 const ERROR_PATTERNS: Array<{
   match: (status: number, msg: string) => boolean;
@@ -15,6 +17,29 @@ const ERROR_PATTERNS: Array<{
   action: string;
   waitMs?: number;
 }> = [
+  // Google Sheets quota (before generic rate_limit)
+  {
+    match: (s, m) => m.includes('userrateLimitExceeded') || m.includes('quota exceeded') || (s === 429 && m.includes('google')),
+    code: 'rate_limit_google_sheets',
+    strategy: 'exponential_backoff',
+    action: 'Google Sheets quota exceeded — backing off 5 seconds',
+    waitMs: 5000,
+  },
+  // OpenAI rate limit (before generic rate_limit)
+  {
+    match: (s, m) => s === 429 && (m.includes('openai') || m.includes('anthropic') || m.includes('tokens per')),
+    code: 'rate_limit_openai',
+    strategy: 'exponential_backoff',
+    action: 'LLM API rate limit — backing off 3 seconds',
+    waitMs: 3000,
+  },
+  // Google OAuth expired (before generic auth_expired)
+  {
+    match: (s, m) => (s === 401 || m.includes('invalid_grant')) && (m.includes('google') || m.includes('gmail') || m.includes('googleapis')),
+    code: 'auth_expired_google',
+    strategy: 'flag_reauth',
+    action: 'Google OAuth expired — credentials need refresh in n8n Settings',
+  },
   // Rate limiting (429)
   {
     match: (s, m) => s === 429 || m.includes('rate limit') || m.includes('too many requests'),
@@ -264,7 +289,15 @@ export class VialOSSelfHeal implements INodeType {
     const failedItems: INodeExecutionData[] = [];
 
     const staticData = this.getWorkflowStaticData('node') as IDataObject;
-    if (!staticData.geneMap) staticData.geneMap = {};
+
+    // Warmup: seed Gene Map with starter patterns on first run
+    if (!staticData.geneMap || !staticData.warmedUp) {
+      const existing = (staticData.geneMap as Record<string, unknown>) || {};
+      // Merge starter genes — don't overwrite user's real data
+      staticData.geneMap = { ...STARTER_GENES, ...existing };
+      staticData.warmedUp = true;
+    }
+
     const geneMap = staticData.geneMap as Record<string, {
       strategy: string;
       successCount: number;
@@ -431,7 +464,8 @@ export class VialOSSelfHeal implements INodeType {
               repaired: attempt > 1,
               repairLog,
               geneMapSize: Object.keys(geneMap).length,
-              geneMapKeys: Object.keys(geneMap),
+              starterGenes: getStarterGeneCount(),
+              userGenes: Object.keys(geneMap).length - getStarterGeneCount(),
             },
           },
           pairedItem: { item: i },
@@ -446,7 +480,8 @@ export class VialOSSelfHeal implements INodeType {
             _vialos: {
               errorCode: repairLog[repairLog.length - 1]?.split('|')[0] ?? 'unknown',
               geneMapSize: Object.keys(geneMap).length,
-              geneMapKeys: Object.keys(geneMap),
+              starterGenes: getStarterGeneCount(),
+              userGenes: Object.keys(geneMap).length - getStarterGeneCount(),
               suggestion: getSuggestion(repairLog[repairLog.length - 1]?.split('|')[0] ?? ''),
             },
           },
@@ -472,7 +507,11 @@ export class VialOSSelfHeal implements INodeType {
 function getSuggestion(errorCode: string): string {
   const suggestions: Record<string, string> = {
     rate_limit: 'Add a Wait node before this node, or reduce request frequency. Gene Map will optimize backoff timing over time.',
+    rate_limit_google_sheets: 'Google Sheets quota resets every 100 seconds. Add a Wait node (5-10s) between batch operations, or use a service account instead of OAuth.',
+    rate_limit_openai: 'OpenAI rate limits reset per minute. Reduce request frequency or upgrade your OpenAI plan tier.',
     auth_expired: 'Refresh your OAuth credentials in n8n Settings → Credentials. Consider using a service account for long-running workflows.',
+    auth_expired_google: 'Google personal OAuth tokens expire every 7 days. Use a Google Service Account for uninterrupted automation.',
+    auth_expired_gmail: 'Gmail Trigger OAuth expired silently. Go to n8n Settings → Credentials → Gmail → Reconnect.',
     schema_drift: 'The API changed its request format. Check API docs and update your request body.',
     forbidden: 'Check API key permissions. The credential may need additional scopes.',
     quota_exceeded: 'API quota reached. Add delays between executions or upgrade your API plan.',
