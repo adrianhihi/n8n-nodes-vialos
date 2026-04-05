@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-vialos",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Self-healing HTTP/API node for n8n — auto-repairs failed requests using VialOS PCEC engine and Gene Map pattern learning",
   "keywords": [
     "n8n-community-node-package",
