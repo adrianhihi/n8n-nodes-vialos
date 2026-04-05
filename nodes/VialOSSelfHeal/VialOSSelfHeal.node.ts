@@ -17,88 +17,175 @@ const ERROR_PATTERNS: Array<{
   action: string;
   waitMs?: number;
 }> = [
-  // Google Sheets quota (before generic rate_limit)
+  // ── Most specific patterns first ────────────────────────────────────────
+
+  // Google Sheets quota — exact error message from community threads
   {
-    match: (s, m) => m.includes('userrateLimitExceeded') || m.includes('quota exceeded') || (s === 429 && m.includes('google')),
+    match: (s, m) =>
+      m.includes('sheets.googleapis.com') ||
+      m.includes('quota metric') ||
+      m.includes('userrateLimitExceeded') ||
+      (s === 429 && m.includes('google') && m.includes('quota')),
     code: 'rate_limit_google_sheets',
     strategy: 'exponential_backoff',
-    action: 'Google Sheets quota exceeded — backing off 5 seconds',
+    action: 'Google Sheets quota exceeded — waiting 10 seconds before retry',
+    waitMs: 10000,
+  },
+
+  // LLM API rate limits (OpenAI, Anthropic, Gemini)
+  {
+    match: (s, m) =>
+      s === 429 && (
+        m.includes('openai') ||
+        m.includes('anthropic') ||
+        m.includes('gemini') ||
+        m.includes('tokens per') ||
+        m.includes('generate_content') ||
+        m.includes('requests per minute')
+      ),
+    code: 'rate_limit_llm',
+    strategy: 'exponential_backoff',
+    action: 'LLM API rate limit — waiting before retry',
     waitMs: 5000,
   },
-  // OpenAI rate limit (before generic rate_limit)
+
+  // Google OAuth expired — invalid_grant is the specific error
   {
-    match: (s, m) => s === 429 && (m.includes('openai') || m.includes('anthropic') || m.includes('tokens per')),
-    code: 'rate_limit_openai',
-    strategy: 'exponential_backoff',
-    action: 'LLM API rate limit — backing off 3 seconds',
-    waitMs: 3000,
-  },
-  // Google OAuth expired (before generic auth_expired)
-  {
-    match: (s, m) => (s === 401 || m.includes('invalid_grant')) && (m.includes('google') || m.includes('gmail') || m.includes('googleapis')),
+    match: (s, m) =>
+      m.includes('invalid_grant') ||
+      (m.includes('google') && m.includes('token') && m.includes('expired')) ||
+      (m.includes('googleapis') && (s === 401 || m.includes('unauthorized'))),
     code: 'auth_expired_google',
     strategy: 'flag_reauth',
-    action: 'Google OAuth expired — credentials need refresh in n8n Settings',
+    action: 'Google OAuth token expired — credentials need refresh',
   },
-  // Rate limiting (429)
+
+  // 403 that looks like auth expiry (GitHub issue #18517 pattern)
   {
-    match: (s, m) => s === 429 || m.includes('rate limit') || m.includes('too many requests'),
+    match: (s, m) =>
+      s === 403 && (
+        m.includes('invalid access token') ||
+        m.includes('token expired') ||
+        m.includes('token has expired') ||
+        m.includes('access token is invalid')
+      ),
+    code: 'auth_expired_403',
+    strategy: 'flag_reauth',
+    action: 'Token expired (403) — some APIs use 403 instead of 401 for expired tokens',
+  },
+
+  // Connection refused
+  {
+    match: (s, m) =>
+      m.includes('connection refused') ||
+      m.includes('econnrefused') ||
+      m.includes('connect etimedout'),
+    code: 'connection_refused',
+    strategy: 'retry_with_backoff',
+    action: 'Connection refused — service may be temporarily down, retrying',
+    waitMs: 5000,
+  },
+
+  // ── Generic patterns ────────────────────────────────────────────────────
+
+  // Generic rate limit (429)
+  {
+    match: (s, m) =>
+      s === 429 ||
+      m.includes('rate limit') ||
+      m.includes('too many requests'),
     code: 'rate_limit',
     strategy: 'exponential_backoff',
-    action: 'Waiting before retry (exponential backoff)',
+    action: 'Rate limit hit — applying exponential backoff',
     waitMs: 2000,
   },
+
+  // Quota exceeded (different from rate limit — harder quota)
+  {
+    match: (s, m) =>
+      m.includes('quota exceeded') ||
+      m.includes('limit exceeded') ||
+      m.includes('quota_exceeded'),
+    code: 'quota_exceeded',
+    strategy: 'exponential_backoff',
+    action: 'API quota exceeded — waiting before retry',
+    waitMs: 10000,
+  },
+
   // Auth expired (401)
   {
-    match: (s, m) => s === 401 || m.includes('unauthorized') || m.includes('token expired') || m.includes('invalid_grant'),
+    match: (s, m) =>
+      s === 401 ||
+      m.includes('unauthorized') ||
+      m.includes('token expired') ||
+      m.includes('invalid token') ||
+      m.includes('authentication failed'),
     code: 'auth_expired',
     strategy: 'flag_reauth',
-    action: 'Auth token expired — flagging for re-authentication',
+    action: 'Authentication failed — credentials need refresh',
   },
-  // Bad request / schema drift (400)
+
+  // Forbidden (403)
   {
-    match: (s, m) => s === 400 || m.includes('bad request') || m.includes('invalid parameter') || m.includes('validation'),
-    code: 'schema_drift',
-    strategy: 'log_and_skip',
-    action: 'Bad request detected — logging schema issue',
+    match: (s, m) =>
+      s === 403 ||
+      m.includes('forbidden') ||
+      m.includes('access denied') ||
+      m.includes('insufficient scope'),
+    code: 'forbidden',
+    strategy: 'flag_permission',
+    action: 'Access denied — check API permissions and scopes',
   },
+
   // Not found (404)
   {
-    match: (s, m) => s === 404 || m.includes('not found'),
+    match: (s, m) =>
+      s === 404 ||
+      m.includes('not found') ||
+      m.includes('does not exist'),
     code: 'not_found',
     strategy: 'log_and_skip',
     action: 'Resource not found — skipping item',
   },
-  // Server error (500/502/503/504)
+
+  // Schema / bad request (400)
   {
-    match: (s, m) => s >= 500 || m.includes('server error') || m.includes('service unavailable') || m.includes('bad gateway'),
+    match: (s, m) =>
+      s === 400 ||
+      m.includes('bad request') ||
+      m.includes('invalid parameter') ||
+      m.includes('validation error') ||
+      m.includes('malformed'),
+    code: 'schema_drift',
+    strategy: 'log_and_skip',
+    action: 'Bad request — API may have changed its expected format',
+  },
+
+  // Server errors (5xx)
+  {
+    match: (s, m) =>
+      s >= 500 ||
+      m.includes('internal server error') ||
+      m.includes('service unavailable') ||
+      m.includes('bad gateway') ||
+      m.includes('gateway timeout'),
     code: 'server_error',
     strategy: 'retry_with_backoff',
     action: 'Server error — retrying with delay',
     waitMs: 3000,
   },
+
   // Timeout
   {
-    match: (s, m) => m.includes('timeout') || m.includes('etimedout') || m.includes('econnreset'),
+    match: (s, m) =>
+      m.includes('timeout') ||
+      m.includes('etimedout') ||
+      m.includes('econnreset') ||
+      m.includes('socket hang up'),
     code: 'timeout',
     strategy: 'retry_with_backoff',
     action: 'Request timed out — retrying',
-    waitMs: 1500,
-  },
-  // Forbidden (403)
-  {
-    match: (s, m) => s === 403 || m.includes('forbidden') || m.includes('access denied'),
-    code: 'forbidden',
-    strategy: 'flag_permission',
-    action: 'Access denied — check API permissions',
-  },
-  // Quota exceeded (Google APIs, etc.)
-  {
-    match: (s, m) => m.includes('quota') || m.includes('limit exceeded') || m.includes('userRateLimitExceeded'),
-    code: 'quota_exceeded',
-    strategy: 'exponential_backoff',
-    action: 'API quota exceeded — backing off',
-    waitMs: 5000,
+    waitMs: 2000,
   },
 ];
 
@@ -506,19 +593,72 @@ export class VialOSSelfHeal implements INodeType {
 
 function getSuggestion(errorCode: string): string {
   const suggestions: Record<string, string> = {
-    rate_limit: 'Add a Wait node before this node, or reduce request frequency. Gene Map will optimize backoff timing over time.',
-    rate_limit_google_sheets: 'Google Sheets quota resets every 100 seconds. Add a Wait node (5-10s) between batch operations, or use a service account instead of OAuth.',
-    rate_limit_openai: 'OpenAI rate limits reset per minute. Reduce request frequency or upgrade your OpenAI plan tier.',
-    auth_expired: 'Refresh your OAuth credentials in n8n Settings → Credentials. Consider using a service account for long-running workflows.',
-    auth_expired_google: 'Google personal OAuth tokens expire every 7 days. Use a Google Service Account for uninterrupted automation.',
-    auth_expired_gmail: 'Gmail Trigger OAuth expired silently. Go to n8n Settings → Credentials → Gmail → Reconnect.',
-    schema_drift: 'The API changed its request format. Check API docs and update your request body.',
-    forbidden: 'Check API key permissions. The credential may need additional scopes.',
-    quota_exceeded: 'API quota reached. Add delays between executions or upgrade your API plan.',
-    server_error: 'The API server is having issues. This is transient — Gene Map will retry with backoff.',
-    timeout: 'Request timed out. The API may be slow — consider increasing n8n timeout settings.',
-    not_found: 'The resource was not found. Check the URL or resource ID.',
-    unknown_error: 'Unknown error. Check the error message in repairLog for details.',
+    rate_limit:
+      'Rate limit hit. VialOS applied exponential backoff. ' +
+      'To prevent this: add a Wait node before batch operations, or reduce request frequency.',
+
+    rate_limit_google_sheets:
+      'Google Sheets quota: 300 reads/min per project, 60 reads/min per user. ' +
+      'n8n Cloud users share quota across all workflows. ' +
+      'Fix: (1) Add Wait node (10s+) between Google Sheets reads. ' +
+      '(2) Switch to a Google Service Account — separate quota per account.',
+
+    rate_limit_llm:
+      'LLM API rate limit. OpenAI free tier: 3 RPM. Gemini free tier may have limit=0 on some models. ' +
+      'Fix: add Wait node between LLM calls, or upgrade your API plan.',
+
+    auth_expired:
+      'Credentials expired. Go to n8n Settings → Credentials → find the expired credential → Reconnect. ' +
+      'For long-running workflows, prefer Service Accounts over OAuth (never expire).',
+
+    auth_expired_google:
+      'Google OAuth token expired. MOST LIKELY CAUSE: your Google OAuth app is in "Testing" mode — ' +
+      'Google enforces 7-day hard expiry on Testing apps. ' +
+      'FIX: Go to Google Cloud Console → OAuth consent screen → change to "In production". ' +
+      'BETTER FIX: Switch to a Google Service Account (Settings → Credentials → Google Service Account).',
+
+    auth_expired_403:
+      'Token expired but API returned 403 instead of 401. ' +
+      'This is a known n8n limitation (GitHub issue #18517, Aug 2025). ' +
+      'n8n only auto-refreshes OAuth tokens on 401 — 403-based expiry is not handled. ' +
+      'Fix: manually reconnect credential in n8n Settings.',
+
+    forbidden:
+      'Token is valid but lacks required permissions. ' +
+      'Google: add read/write scope in Cloud Console. ' +
+      'Slack: add missing scope (channels:read, chat:write) and reinstall app. ' +
+      'Notion: share the page with your integration.',
+
+    schema_drift:
+      'Bad request — API may have changed its expected format. ' +
+      'Retry with same data will not help. ' +
+      'Check the API docs for recent changes and update your request body.',
+
+    quota_exceeded:
+      'Hard quota limit reached (not just rate limit). ' +
+      'For Google Sheets: switch to a Service Account for separate quota. ' +
+      'For other APIs: check your plan limits and consider upgrading.',
+
+    not_found:
+      'Resource not found. Check the URL or resource ID. ' +
+      'If this is expected (deleted records), route to a different branch.',
+
+    server_error:
+      'Server error — usually transient. VialOS retried with backoff. ' +
+      'If persistent, check the API status page.',
+
+    timeout:
+      'Request timed out. ' +
+      'If your workflow takes too long for a webhook caller (Slack: 3s, Stripe: 30s): ' +
+      'send an immediate 200 response, then process async in a separate workflow.',
+
+    connection_refused:
+      'Could not connect to the service. ' +
+      'Check: correct URL? Service is up? Firewall rules? ' +
+      'Check the target service status page.',
+
+    unknown_error:
+      'Unknown error. Check the full error message in repairLog for details.',
   };
   return suggestions[errorCode] ?? 'Check the error details above.';
 }
