@@ -339,19 +339,39 @@ export class VialOSSelfHeal implements INodeType {
           const body = (response as any)?.body ?? response;
 
           if (statusCode >= 200 && statusCode < 300) {
-            // Success — update gene map
-            if (learnPatterns && attempt > 1) {
-              // We repaired it — record the successful strategy
-              const lastRepair = repairLog[repairLog.length - 1];
-              if (lastRepair) {
-                const geneKey = lastRepair.split('|')[0];
-                if (geneMap[geneKey]) {
-                  geneMap[geneKey].successCount++;
-                  geneMap[geneKey].totalCount++;
-                  geneMap[geneKey].lastSeen = new Date().toISOString();
+            // Success — record to Gene Map regardless of attempt count
+            if (learnPatterns) {
+              // Record successful endpoint pattern
+              try {
+                const hostname = new URL(url).hostname;
+                const endpointKey = `endpoint_${hostname}`;
+                if (!geneMap[endpointKey]) {
+                  geneMap[endpointKey] = {
+                    strategy: 'direct_success',
+                    successCount: 0,
+                    totalCount: 0,
+                    lastSeen: '',
+                  };
+                }
+                geneMap[endpointKey].successCount++;
+                geneMap[endpointKey].totalCount++;
+                geneMap[endpointKey].lastSeen = new Date().toISOString();
+              } catch (_) {}
+
+              // If this was a repair, record the successful repair strategy too
+              if (attempt > 1) {
+                const lastRepair = repairLog[repairLog.length - 1];
+                if (lastRepair) {
+                  const geneKey = lastRepair.split('|')[0];
+                  if (geneMap[geneKey]) {
+                    geneMap[geneKey].successCount++;
+                    geneMap[geneKey].totalCount++;
+                    geneMap[geneKey].lastSeen = new Date().toISOString();
+                  }
                 }
               }
             }
+
             responseData = typeof body === 'string' ? { data: body } : (body as IDataObject);
             succeeded = true;
             break;
@@ -427,6 +447,7 @@ export class VialOSSelfHeal implements INodeType {
               repaired: attempt > 1,
               repairLog,
               geneMapSize: Object.keys(geneMap).length,
+              geneMapKeys: Object.keys(geneMap),
             },
           },
           pairedItem: { item: i },
