@@ -263,10 +263,23 @@ export class VialOSSelfHeal implements INodeType {
     const successItems: INodeExecutionData[] = [];
     const failedItems: INodeExecutionData[] = [];
 
-    // Gene Map — persisted across workflow runs via n8n static data
     const staticData = this.getWorkflowStaticData('node') as IDataObject;
     if (!staticData.geneMap) staticData.geneMap = {};
-    const geneMap = staticData.geneMap as Record<string, { strategy: string; successCount: number; totalCount: number; lastSeen: string }>;
+    const geneMap = staticData.geneMap as Record<string, {
+      strategy: string;
+      successCount: number;
+      totalCount: number;
+      lastSeen: string;
+    }>;
+
+    function writeGene(key: string, strategy: string, success: boolean) {
+      if (!geneMap[key]) {
+        geneMap[key] = { strategy, successCount: 0, totalCount: 0, lastSeen: '' };
+      }
+      geneMap[key].totalCount++;
+      if (success) geneMap[key].successCount++;
+      geneMap[key].lastSeen = new Date().toISOString();
+    }
 
     for (let i = 0; i < items.length; i++) {
       const url = this.getNodeParameter('url', i) as string;
@@ -280,7 +293,6 @@ export class VialOSSelfHeal implements INodeType {
       const learnPatterns = (healingSettings.learnPatterns as boolean) ?? true;
       const routeFailures = (healingSettings.routeFailures as boolean) ?? true;
 
-      // Build request options
       const requestOptions: IDataObject = {
         method,
         url,
@@ -289,29 +301,25 @@ export class VialOSSelfHeal implements INodeType {
         headers: {} as Record<string, string>,
       };
 
-      // Auth
       const headers = requestOptions.headers as Record<string, string>;
       if (authentication === 'bearer') {
-        const token = this.getNodeParameter('bearerToken', i) as string;
-        headers['Authorization'] = `Bearer ${token}`;
+        headers['Authorization'] = `Bearer ${this.getNodeParameter('bearerToken', i)}`;
       } else if (authentication === 'apikey') {
         const headerName = this.getNodeParameter('apiKeyHeader', i) as string;
-        const headerValue = this.getNodeParameter('apiKeyValue', i) as string;
-        headers[headerName] = headerValue;
+        headers[headerName] = this.getNodeParameter('apiKeyValue', i) as string;
       } else if (authentication === 'basic') {
-        const username = this.getNodeParameter('username', i) as string;
-        const password = this.getNodeParameter('password', i) as string;
-        const encoded = Buffer.from(`${username}:${password}`).toString('base64');
-        headers['Authorization'] = `Basic ${encoded}`;
+        const u = this.getNodeParameter('username', i) as string;
+        const p = this.getNodeParameter('password', i) as string;
+        headers['Authorization'] = `Basic ${Buffer.from(`${u}:${p}`).toString('base64')}`;
       }
 
-      // Custom headers
-      const customHeaders = this.getNodeParameter('headers', i, { parameter: [] }) as { parameter: Array<{ name: string; value: string }> };
-      for (const h of (customHeaders.parameter || [])) {
+      const customHeaders = this.getNodeParameter('headers', i, { parameter: [] }) as {
+        parameter: Array<{ name: string; value: string }>;
+      };
+      for (const h of customHeaders.parameter || []) {
         headers[h.name] = h.value;
       }
 
-      // Body
       if (['POST', 'PUT', 'PATCH'].includes(method)) {
         const bodyStr = this.getNodeParameter('body', i, '') as string;
         if (bodyStr) {
@@ -324,10 +332,9 @@ export class VialOSSelfHeal implements INodeType {
         }
       }
 
-      // PCEC loop
       let attempt = 0;
       let lastError: Error | null = null;
-      let repairLog: string[] = [];
+      const repairLog: string[] = [];
       let succeeded = false;
       let responseData: IDataObject | null = null;
 
@@ -339,88 +346,40 @@ export class VialOSSelfHeal implements INodeType {
           const body = (response as any)?.body ?? response;
 
           if (statusCode >= 200 && statusCode < 300) {
-            // Success — record to Gene Map regardless of attempt count
+            // ── SUCCESS ──────────────────────────────────────────────────
             if (learnPatterns) {
-              // Record successful endpoint pattern
+              // Record the successful endpoint
               try {
                 const hostname = new URL(url).hostname;
-                const endpointKey = `endpoint_${hostname}`;
-                if (!geneMap[endpointKey]) {
-                  geneMap[endpointKey] = {
-                    strategy: 'direct_success',
-                    successCount: 0,
-                    totalCount: 0,
-                    lastSeen: '',
-                  };
-                }
-                geneMap[endpointKey].successCount++;
-                geneMap[endpointKey].totalCount++;
-                geneMap[endpointKey].lastSeen = new Date().toISOString();
+                writeGene(`endpoint_${hostname}`, 'direct_success', true);
               } catch (_) {}
 
-              // If this was a repair, record the successful repair strategy too
-              if (attempt > 1) {
+              // If this was a repair, record the repair strategy too
+              if (attempt > 1 && repairLog.length > 0) {
                 const lastRepair = repairLog[repairLog.length - 1];
-                if (lastRepair) {
-                  const geneKey = lastRepair.split('|')[0];
-                  if (geneMap[geneKey]) {
-                    geneMap[geneKey].successCount++;
-                    geneMap[geneKey].totalCount++;
-                    geneMap[geneKey].lastSeen = new Date().toISOString();
-                  }
-                }
+                const geneKey = lastRepair.split('|')[0];
+                writeGene(geneKey, 'repaired', true);
               }
             }
-
             responseData = typeof body === 'string' ? { data: body } : (body as IDataObject);
             succeeded = true;
             break;
           }
 
-          // Error response — classify and repair
+          // ── ERROR RESPONSE (non-2xx) ──────────────────────────────────
           const errorMsg = JSON.stringify(body) || `HTTP ${statusCode}`;
           const classified = classifyError(statusCode, errorMsg);
 
-          // Check gene map for known strategy
-          const geneKey = `${classified.code}`;
-          if (learnPatterns && geneMap[geneKey]) {
-            const gene = geneMap[geneKey];
-            gene.totalCount++;
-            gene.lastSeen = new Date().toISOString();
-          } else if (learnPatterns) {
-            geneMap[geneKey] = {
-              strategy: classified.strategy,
-              successCount: 0,
-              totalCount: 1,
-              lastSeen: new Date().toISOString(),
-            };
+          if (learnPatterns) {
+            writeGene(classified.code, classified.strategy, false);
           }
-
-          repairLog.push(`${geneKey}|${classified.strategy}|attempt${attempt}`);
-
-          if (attempt >= maxAttempts) {
-            lastError = new Error(`Failed after ${maxAttempts} attempts. Last error: HTTP ${statusCode} — ${errorMsg}. Repair log: ${repairLog.join(', ')}`);
-            break;
-          }
-
-          // Apply repair strategy
-          if (classified.waitMs) {
-            const backoff = Math.min(classified.waitMs * Math.pow(1.5, attempt - 1), maxBackoffMs);
-            await sleep(backoff);
-          }
-
-          // Log the repair action
-          this.logger.info(`[VialOS] ${classified.action} (attempt ${attempt}/${maxAttempts})`);
-
-        } catch (err: any) {
-          const errorMsg = err?.message || String(err);
-          const statusCode = err?.statusCode ?? err?.response?.statusCode ?? 0;
-          const classified = classifyError(statusCode, errorMsg);
 
           repairLog.push(`${classified.code}|${classified.strategy}|attempt${attempt}`);
 
           if (attempt >= maxAttempts) {
-            lastError = new Error(`Failed after ${maxAttempts} attempts. Error: ${errorMsg}. Repair log: ${repairLog.join(', ')}`);
+            lastError = new Error(
+              `Failed after ${maxAttempts} attempts. Last error: HTTP ${statusCode} — ${errorMsg}. Repair log: ${repairLog.join(', ')}`,
+            );
             break;
           }
 
@@ -428,12 +387,37 @@ export class VialOSSelfHeal implements INodeType {
             const backoff = Math.min(classified.waitMs * Math.pow(1.5, attempt - 1), maxBackoffMs);
             await sleep(backoff);
           }
+          this.logger.info(`[VialOS] ${classified.action} (attempt ${attempt}/${maxAttempts})`);
 
+        } catch (err: any) {
+          // ── EXCEPTION (network error, timeout, etc.) ──────────────────
+          const errorMsg = (err?.message || String(err)).toLowerCase();
+          const statusCode = err?.statusCode ?? err?.response?.statusCode ?? 0;
+          const classified = classifyError(statusCode, errorMsg);
+
+          // Write to Gene Map even on exception
+          if (learnPatterns) {
+            writeGene(classified.code, classified.strategy, false);
+          }
+
+          repairLog.push(`${classified.code}|${classified.strategy}|attempt${attempt}`);
+
+          if (attempt >= maxAttempts) {
+            lastError = new Error(
+              `Failed after ${maxAttempts} attempts. Error: ${err?.message || String(err)}. Repair log: ${repairLog.join(', ')}`,
+            );
+            break;
+          }
+
+          if (classified.waitMs) {
+            const backoff = Math.min(classified.waitMs * Math.pow(1.5, attempt - 1), maxBackoffMs);
+            await sleep(backoff);
+          }
           this.logger.info(`[VialOS] ${classified.action} (attempt ${attempt}/${maxAttempts})`);
         }
       }
 
-      // Save gene map
+      // Persist Gene Map
       if (learnPatterns) {
         staticData.geneMap = geneMap;
       }
@@ -462,6 +446,7 @@ export class VialOSSelfHeal implements INodeType {
             _vialos: {
               errorCode: repairLog[repairLog.length - 1]?.split('|')[0] ?? 'unknown',
               geneMapSize: Object.keys(geneMap).length,
+              geneMapKeys: Object.keys(geneMap),
               suggestion: getSuggestion(repairLog[repairLog.length - 1]?.split('|')[0] ?? ''),
             },
           },
@@ -474,7 +459,7 @@ export class VialOSSelfHeal implements INodeType {
           throw new NodeOperationError(
             this.getNode(),
             lastError?.message ?? 'Request failed',
-            { itemIndex: i }
+            { itemIndex: i },
           );
         }
       }
