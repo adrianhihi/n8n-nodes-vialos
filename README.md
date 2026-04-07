@@ -104,6 +104,23 @@ you get intelligent handling from day one.
 - API Key (header)
 - Basic Auth
 
+## Google OAuth Auto-Refresh
+
+When wrapping Google API calls (Sheets, Gmail, Drive, Calendar), enable
+**Google OAuth Auto-Refresh** in the node settings and connect your
+Google OAuth2 credential.
+
+When a 401 is detected from a Google API:
+1. The node automatically requests a new access token using your refresh token
+2. Retries the original request with the new token
+3. Stores the repair pattern in Gene Map (`google_oauth_refresh` strategy)
+
+**Setup:**
+1. Add the VialOS Self-Heal node to your workflow
+2. Toggle "Google OAuth Auto-Refresh" to ON
+3. Select your Google OAuth2 credential
+4. Done — token refresh happens automatically from now on
+
 ## Starter Gene Map
 
 Pre-loaded with 11 patterns from real n8n community reports (2021–2026):

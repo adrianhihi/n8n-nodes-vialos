@@ -209,6 +209,39 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function isGoogleUrl(url: string): boolean {
+  return url.includes('googleapis.com') ||
+    url.includes('google.com') ||
+    url.includes('accounts.google.com');
+}
+
+async function refreshGoogleOAuthToken(
+  context: IExecuteFunctions,
+  credentials: IDataObject,
+): Promise<string | null> {
+  try {
+    const tokenData = credentials.oauthTokenData as IDataObject | undefined;
+    const refreshToken = tokenData?.refresh_token as string | undefined;
+    if (!refreshToken) return null;
+
+    const response = await context.helpers.request({
+      method: 'POST',
+      url: 'https://oauth2.googleapis.com/token',
+      form: {
+        client_id: credentials.clientId,
+        client_secret: credentials.clientSecret,
+        refresh_token: refreshToken,
+        grant_type: 'refresh_token',
+      },
+    });
+
+    const data = typeof response === 'string' ? JSON.parse(response) : response;
+    return data.access_token || null;
+  } catch {
+    return null;
+  }
+}
+
 export class VialOSSelfHeal implements INodeType {
   description: INodeTypeDescription = {
     displayName: 'VialOS Self-Heal',
@@ -221,6 +254,12 @@ export class VialOSSelfHeal implements INodeType {
     defaults: {
       name: 'VialOS Self-Heal',
     },
+    credentials: [
+      {
+        name: 'googleOAuth2Api',
+        required: false,
+      },
+    ],
     inputs: ['main'],
     outputs: ['main', 'main'],
     outputNames: ['Success', 'Repaired / Failed'],
@@ -323,6 +362,14 @@ export class VialOSSelfHeal implements INodeType {
         displayOptions: { show: { method: ['POST', 'PUT', 'PATCH'] } },
         description: 'JSON body to send with the request',
       },
+      // ── GOOGLE OAUTH ──────────────────────────────────────────────
+      {
+        displayName: 'Google OAuth Auto-Refresh',
+        name: 'googleOAuthRefresh',
+        type: 'boolean',
+        default: false,
+        description: 'Automatically refresh Google OAuth token when a 401 is detected. Requires Google OAuth2 credential to be connected.',
+      },
       // ── HEALING SETTINGS ────────────────────────────────────────
       {
         displayName: 'Healing Settings',
@@ -413,6 +460,7 @@ export class VialOSSelfHeal implements INodeType {
       const maxBackoffMs = (healingSettings.maxBackoffMs as number) ?? 30000;
       const learnPatterns = (healingSettings.learnPatterns as boolean) ?? true;
       const routeFailures = (healingSettings.routeFailures as boolean) ?? true;
+      const googleOAuthRefresh = this.getNodeParameter('googleOAuthRefresh', i, false) as boolean;
 
       const requestOptions: IDataObject = {
         method,
@@ -491,6 +539,26 @@ export class VialOSSelfHeal implements INodeType {
           const errorMsg = JSON.stringify(body) || `HTTP ${statusCode}`;
           const classified = classifyError(statusCode, errorMsg);
 
+          // ── Google OAuth auto-refresh on 401 ────────────────────────
+          if (googleOAuthRefresh && statusCode === 401 && isGoogleUrl(url)) {
+            try {
+              const googleCreds = await this.getCredentials('googleOAuth2Api') as IDataObject;
+              if (googleCreds) {
+                this.logger.info('[VialOS] Google OAuth 401 detected → refreshing token');
+                const newToken = await refreshGoogleOAuthToken(this, googleCreds);
+                if (newToken) {
+                  (requestOptions.headers as Record<string, string>)['Authorization'] = `Bearer ${newToken}`;
+                  repairLog.push(`auth_expired_google|google_oauth_refresh|attempt${attempt}`);
+                  if (learnPatterns) writeGene('auth_expired_google', 'google_oauth_refresh', false);
+                  this.logger.info('[VialOS] Token refreshed → retrying request');
+                  continue; // retry immediately with new token
+                }
+              }
+            } catch (_) {
+              // Credential not configured — fall through to normal handling
+            }
+          }
+
           if (learnPatterns) {
             writeGene(classified.code, classified.strategy, false);
           }
@@ -515,6 +583,26 @@ export class VialOSSelfHeal implements INodeType {
           const errorMsg = (err?.message || String(err)).toLowerCase();
           const statusCode = err?.statusCode ?? err?.response?.statusCode ?? 0;
           const classified = classifyError(statusCode, errorMsg);
+
+          // ── Google OAuth auto-refresh on 401 exception ──────────────
+          if (googleOAuthRefresh && statusCode === 401 && isGoogleUrl(url)) {
+            try {
+              const googleCreds = await this.getCredentials('googleOAuth2Api') as IDataObject;
+              if (googleCreds) {
+                this.logger.info('[VialOS] Google OAuth 401 exception → refreshing token');
+                const newToken = await refreshGoogleOAuthToken(this, googleCreds);
+                if (newToken) {
+                  (requestOptions.headers as Record<string, string>)['Authorization'] = `Bearer ${newToken}`;
+                  repairLog.push(`auth_expired_google|google_oauth_refresh|attempt${attempt}`);
+                  if (learnPatterns) writeGene('auth_expired_google', 'google_oauth_refresh', false);
+                  this.logger.info('[VialOS] Token refreshed → retrying request');
+                  continue; // retry immediately with new token
+                }
+              }
+            } catch (_) {
+              // Credential not configured — fall through
+            }
+          }
 
           // Write to Gene Map even on exception
           if (learnPatterns) {
