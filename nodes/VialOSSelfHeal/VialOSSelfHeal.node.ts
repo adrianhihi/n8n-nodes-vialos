@@ -8,6 +8,7 @@ import {
 } from 'n8n-workflow';
 
 import { STARTER_GENES, getStarterGeneCount } from './starterGenes';
+import { trackN8nRepair } from './telemetry';
 
 // Error classification — maps HTTP/API errors to PCEC failure codes
 const ERROR_PATTERNS: Array<{
@@ -543,6 +544,7 @@ export class VialOSSelfHeal implements INodeType {
       }
 
       if (succeeded && responseData !== null) {
+        const userGenes = Object.keys(geneMap).length - getStarterGeneCount();
         successItems.push({
           json: {
             ...responseData,
@@ -552,12 +554,24 @@ export class VialOSSelfHeal implements INodeType {
               repairLog,
               geneMapSize: Object.keys(geneMap).length,
               starterGenes: getStarterGeneCount(),
-              userGenes: Object.keys(geneMap).length - getStarterGeneCount(),
+              userGenes,
             },
           },
           pairedItem: { item: i },
         });
+
+        // Telemetry — fire and forget, silent failure
+        const lastRepairEntry = repairLog[repairLog.length - 1];
+        trackN8nRepair({
+          errorCode: lastRepairEntry?.split('|')[0] ?? 'none',
+          repairApplied: attempt > 1 ? (lastRepairEntry?.split('|')[1] ?? null) : null,
+          success: true,
+          attempts: attempt,
+          userGenes,
+        });
       } else {
+        const errorCode = repairLog[repairLog.length - 1]?.split('|')[0] ?? 'unknown';
+        const userGenes = Object.keys(geneMap).length - getStarterGeneCount();
         const failedItem: INodeExecutionData = {
           json: {
             error: lastError?.message ?? 'Unknown error',
@@ -565,15 +579,25 @@ export class VialOSSelfHeal implements INodeType {
             attempts: attempt,
             repairLog,
             _vialos: {
-              errorCode: repairLog[repairLog.length - 1]?.split('|')[0] ?? 'unknown',
+              errorCode,
               geneMapSize: Object.keys(geneMap).length,
               starterGenes: getStarterGeneCount(),
-              userGenes: Object.keys(geneMap).length - getStarterGeneCount(),
-              suggestion: getSuggestion(repairLog[repairLog.length - 1]?.split('|')[0] ?? ''),
+              userGenes,
+              suggestion: getSuggestion(errorCode),
             },
           },
           pairedItem: { item: i },
         };
+
+        // Telemetry — fire and forget, silent failure
+        const lastRepairEntry = repairLog[repairLog.length - 1];
+        trackN8nRepair({
+          errorCode,
+          repairApplied: lastRepairEntry?.split('|')[1] ?? null,
+          success: false,
+          attempts: attempt,
+          userGenes,
+        });
 
         if (routeFailures) {
           failedItems.push(failedItem);
